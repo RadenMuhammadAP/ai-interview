@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'dart:async';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() => runApp(const MyApp());
 
@@ -21,65 +24,114 @@ class SpeechToTextExample extends StatefulWidget {
 
 class _SpeechToTextExampleState extends State<SpeechToTextExample> {
   final SpeechToText _speech = SpeechToText();
+  final FlutterTts _flutterTts = FlutterTts();
   bool _isListening = false;
+  bool _hasSent = false;
   String _recognizedText = '';
+  Timer? _silenceTimer;
+  String _finalText = '';
+  Timer? _repeatListeningTimer;
 
   @override
   void initState() {
     super.initState();
     _initSpeech();
+    _requestMicrophonePermission();
   }
-  
-Future<void> _sendToLaravel(String recognizedText) async {
-  final String apiUrl = 'http://127.0.0.1:8000/api/voice'; // Ganti dengan URL API Laravel Anda
 
-  final response = await http.post(
-    Uri.parse(apiUrl),
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: json.encode({
-      'text': recognizedText,
-    }),
-  );
-
-  if (response.statusCode == 200) {
-	print('Respond Body: ${response.body}');
-    final Map<String, dynamic> responseData = json.decode(response.body);
-    final String chatGPTResponse = responseData['answered'];
-    setState(() {
-      _recognizedText = chatGPTResponse;
-    });
-  } else {
-    print('Failed to send data to Laravel: ${response.statusCode}');
+  Future<void> _requestMicrophonePermission() async {
+    var status = await Permission.microphone.status;
+    if (!status.isGranted) {
+      await Permission.microphone.request();
+    }
   }
-}
-  
+
+  Future<void> _speakText(String text) async {
+    await _flutterTts.setLanguage("en-US");
+    await _flutterTts.setSpeechRate(0.5); // Adjust speed
+    await _flutterTts.setPitch(1.0);      // Adjust pitch
+    await _flutterTts.speak(text);
+	_startRepeatListening();	  
+  }
+
+  Future<void> _sendToLaravel(String recognizedText) async {
+    final String apiUrl = 'http://127.0.0.1:8000/api/voice'; // Change with your backend URL
+
+    final response = await http.post(
+      Uri.parse(apiUrl),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: json.encode({
+        'text': recognizedText,
+      }),
+    );
+
+    if (response.statusCode == 200) {
+      print('Response Body: ${response.body}');
+      final Map<String, dynamic> responseData = json.decode(response.body);
+      final String chatGPTResponse = responseData['answered'];
+      setState(() {
+        _recognizedText = chatGPTResponse;
+      });
+      await _speakText(chatGPTResponse);
+    
+    } else {
+      print('Failed to send data to Laravel: ${response.statusCode}');
+    }
+  }
 
   Future<void> _initSpeech() async {
+    await Permission.microphone.request();
     await _speech.initialize(
       onStatus: (status) {
+        print('Speech status: $status');
         if (status == 'done' && _isListening) {
-          // Restart listening for continuous mode
-          _startListening();
+          _stopListening();
         }
       },
-      onError: (error) {
-        print('Speech error: $error');
-      },
+	  onError: (error) {
+		print('Speech error: $error');
+		if (error.errorMsg == 'no-speech') {
+		  // Ignore no-speech errors
+		  return;
+		}
+		// Handle other errors if necessary
+	  },
     );
   }
 
-  void _startListening() {
+  Future<void> _startListening() async {
+    final systemLocale = await _speech.systemLocale();
+    _finalText = '';
+    _hasSent = false; // Reset when start listening
     _speech.listen(
-	  localeId: 'id_ID', // Bahasa Indonesia	
+      localeId: systemLocale?.localeId ?? 'en_US',
       onResult: (result) {
         setState(() {
           _recognizedText = result.recognizedWords;
-		  print('_recognizedText: ${_recognizedText}');
-		  _sendToLaravel(_recognizedText);		  
+        });
+
+        if (result.finalResult && !_hasSent) {
+          _hasSent = true;
+          _finalText = result.recognizedWords;
+          _stopListening();
+          _sendToLaravel(_finalText);
+          return;
+        }
+
+        // Reset silence timer
+        _silenceTimer?.cancel();
+        _silenceTimer = Timer(Duration(seconds: 2), () {
+          if (!_hasSent) {
+            _hasSent = true;
+            print("User stopped speaking. Sending to Laravel...");
+            _stopListening();
+            _sendToLaravel(_finalText.isNotEmpty ? _finalText : _recognizedText);
+          }
         });
       },
+      listenFor: Duration(seconds: 60), // Duration before stopping
       listenMode: ListenMode.dictation,
       partialResults: true,
       cancelOnError: false,
@@ -88,13 +140,35 @@ Future<void> _sendToLaravel(String recognizedText) async {
     setState(() {
       _isListening = true;
     });
+
+    // Start the auto-repeat mechanism after the session ends
   }
 
   void _stopListening() {
     _speech.stop();
+    _silenceTimer?.cancel();
     setState(() {
       _isListening = false;
     });
+    _repeatListeningTimer?.cancel(); // Cancel any active repeat listening timer
+  }
+
+  // Start the repeat listening process every X seconds (60 seconds for example)
+  void _startRepeatListening() {
+    _repeatListeningTimer = Timer.periodic(Duration(seconds: 60), (_) {
+      if (!_isListening) {
+        print("Restarting listening session...");
+        _startListening();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _silenceTimer?.cancel();
+    _repeatListeningTimer?.cancel(); // Ensure this is canceled when the widget is disposed
+    _speech.stop();
+    super.dispose();
   }
 
   @override
